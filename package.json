@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.995.0",
+    "@sparticuz/chromium": "^143.0.4",
+    "puppeteer": "^24.37.5",
+    "puppeteer-core": "^24.37.5"
+  }
+}

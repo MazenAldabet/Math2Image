@@ -1,0 +1,1 @@
+{"statusCode":200,"body":"{\"message\":\"Uploaded to S3\",\"bucket\":\"prod-content-delivery-platform\",\"key\":\"test-arabic.png\",\"size\":16620,\"width\":500,\"height\":70}"}

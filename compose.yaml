@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: node-test
+    command: node test.js
+    shm_size: "1gb"
+    volumes:
+      - ./output:/app/output
+    environment:
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    driver: bridge
