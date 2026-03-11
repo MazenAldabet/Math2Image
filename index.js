@@ -32,6 +32,13 @@ function response(statusCode, body) {
     };
 }
 
+function getFontDataUrl(fileName) {
+    const basePath = isLambda ? '/var/task/fonts' : path.join(process.cwd(), 'fonts');
+    const fontPath = path.join(basePath, fileName);
+    const fontBuffer = fs.readFileSync(fontPath);
+    return `data:font/ttf;base64,${fontBuffer.toString('base64')}`;
+}
+
 function escapeHtmlForAttribute(value) {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -39,6 +46,162 @@ function escapeHtmlForAttribute(value) {
         .replace(/'/g, '&#39;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
+}
+
+async function setPageContentWithRetry(browser, page, html, options, retries = 5) {
+    let activePage = page;
+
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+        try {
+            await activePage.setContent(html, options);
+            return activePage;
+        } catch (error) {
+            const isEarlyMainFrame = error?.message?.includes('Requesting main frame too early!');
+            const isDetachedFrame = error?.message?.includes('detached Frame');
+
+            if ((!isEarlyMainFrame && !isDetachedFrame) || attempt === retries) {
+                throw error;
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+
+            const openPages = await browser.pages();
+            activePage = openPages.find((candidate) => !candidate.isClosed()) || (await browser.newPage());
+        }
+    }
+}
+
+function decodeNumericEntities(value) {
+    return value.replace(/&#(x?[0-9a-f]+);/gi, (_, rawCode) => {
+        const isHex = rawCode[0].toLowerCase() === 'x';
+        const codePoint = Number.parseInt(isHex ? rawCode.slice(1) : rawCode, isHex ? 16 : 10);
+        if (!Number.isFinite(codePoint)) {
+            return _;
+        }
+        try {
+            return String.fromCodePoint(codePoint);
+        } catch {
+            return _;
+        }
+    });
+}
+
+function escapeMathText(value) {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function isArabicText(value) {
+    return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(value);
+}
+
+function normalizeArabicMathMi(content) {
+    const decoded = decodeNumericEntities(content).replace(/\s+/g, ' ').trim();
+    if (!decoded || !isArabicText(decoded)) {
+        return null;
+    }
+
+    const breakableText = escapeMathText(decoded).replace(/ /g, '&#8203; ');
+    return `<mtext>${breakableText}</mtext>`;
+}
+
+function stripMathTags(mathContent) {
+    return mathContent
+        .replace(/<\/?(math|mrow|mstyle|mtext|mi|mo|mn|ms|mspace)[^>]*>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function isSimpleArabicMathBlock(mathBlock) {
+    const disallowedTags = /<(mfrac|msup|msub|msqrt|mroot|munder|mover|munderover|mtable|mtr|mtd|mfenced|semantics|annotation|annotation-xml)\b/i;
+    return !disallowedTags.test(mathBlock) && containsArabicMathContent(mathBlock);
+}
+
+function convertMultilineMathBlock(mathBlock) {
+    const match = mathBlock.match(/^<math([^>]*)>([\s\S]*)<\/math>$/i);
+    if (!match) {
+        return mathBlock;
+    }
+
+    const [, mathAttrs = '', innerContent] = match;
+    const normalizedBreaks = innerContent.replace(
+        /<mspace\b[^>]*linebreak=(?:"newline"|'newline')[^>]*\/>(?:\s*<mo>(?:&#160;|&nbsp;)<\/mo>)*/gi,
+        '[[MATH_NL]]'
+    );
+
+    const segments = normalizedBreaks
+        .split('[[MATH_NL]]')
+        .map((segment) => segment.trim())
+        .filter(Boolean);
+
+    if (segments.length <= 1) {
+        return mathBlock;
+    }
+
+    return `<div class="math-multiline">${segments
+        .map((segment) => `<div class="math-line"><math${mathAttrs}>${segment}</math></div>`)
+        .join('')}</div>`;
+}
+
+function convertSimpleArabicMathBlock(mathBlock) {
+    const text = decodeNumericEntities(stripMathTags(mathBlock));
+    if (!text || !isArabicText(text)) {
+        return mathBlock;
+    }
+
+    return `<span class="math-text-run" dir="rtl">${escapeMathText(text)}</span>`;
+}
+
+function wrapInlineRtlMath(html) {
+    return html.replace(
+        /(<(?:p|div|span|strong|em|li)\b[^>]*\bdir=(?:"rtl"|'rtl')[^>]*>[\s\S]*?)(<math[\s\S]*?<\/math>)([\s\S]*?<\/(?:p|div|span|strong|em|li)>)/gi,
+        (fullMatch, before, mathBlock, after) => `${before}<span class="inline-math-rtl" dir="rtl">${mathBlock}</span>${after}`
+    );
+}
+
+function reorderAdjacentArabicAndInlineMath(html) {
+    return html.replace(
+        /<span class="inline-math-rtl" dir="rtl">([\s\S]*?<\/math>)<\/span>([\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\s&nbsp;]+)/gu,
+        (fullMatch, mathBlock, arabicText) => `<span class="rtl-inline-run" dir="rtl">${arabicText}<span class="inline-math-rtl" dir="rtl">${mathBlock}</span></span>`
+    );
+}
+
+function containsArabicMathContent(html) {
+    const mathBlocks = html.match(/<math[\s\S]*?<\/math>/gi) || [];
+    return mathBlocks.some((block) => /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(decodeNumericEntities(block)));
+}
+export function preprocessHtmlForRender(html) {
+    const withInlineRtlMath = wrapInlineRtlMath(html);
+    const withAdjacentInlineOrderFixed = reorderAdjacentArabicAndInlineMath(withInlineRtlMath);
+
+    const withMultilineMathBlocks = withAdjacentInlineOrderFixed.replace(/<math[\s\S]*?<\/math>/gi, (mathBlock) => {
+        return convertMultilineMathBlock(mathBlock);
+    });
+
+    const withSimpleArabicMathAsHtml = withMultilineMathBlocks.replace(/<math[\s\S]*?<\/math>/gi, (mathBlock) => {
+        return isSimpleArabicMathBlock(mathBlock)
+            ? convertSimpleArabicMathBlock(mathBlock)
+            : mathBlock;
+    });
+
+    const withNormalizedMi = withSimpleArabicMathAsHtml.replace(/<mi>([\s\S]*?)<\/mi>/gi, (fullMatch, content) => {
+        if (/<[^>]+>/.test(content)) {
+            return fullMatch;
+        }
+
+        const normalized = normalizeArabicMathMi(content);
+        return normalized ? normalized : fullMatch;
+    });
+
+    // Wrap math blocks with <p> if not already wrapped
+    const wrappedMath = withNormalizedMi.replace(
+        /(<math[\s\S]*?<\/math>)/gi,
+        (mathBlock) => `<span>${mathBlock}</span>`
+    );
+
+    return wrappedMath;
 }
 
 export const handler = async (event) => {
@@ -64,25 +227,38 @@ export const handler = async (event) => {
             return response(400, { error: 'bucket and key required for s3' });
         }
 
+        const processedHtml = preprocessHtmlForRender(html);
+        const effectiveUseWiris = useWiris && !containsArabicMathContent(html);
+
+        const initialViewport = {
+            width: Math.max(1, Number(maxWidth) || 300),
+            height: 800,
+            deviceScaleFactor: 2,
+        };
+
         browser = await puppeteer.launch(
             isLambda
                 ? {
                       args: [...chromium.args, '--font-render-hinting=none'],
                       executablePath: await chromium.executablePath(),
                       headless: chromium.headless,
+                      defaultViewport: initialViewport,
                   }
                 : {
                       executablePath:
                           process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
                       headless: 'new',
+                      defaultViewport: initialViewport,
                       args: [
                           '--no-sandbox',
                           '--disable-setuid-sandbox',
+                          '--disable-dev-shm-usage',
                       ],
                   }
         );
 
-        const page = await browser.newPage();
+        const existingPages = await browser.pages();
+        let page = existingPages[0] || (await browser.newPage());
 
         page.on('console', (msg) => {
             console.log('[PAGE LOG]', msg.text());
@@ -92,14 +268,9 @@ export const handler = async (event) => {
             console.error('[PAGE ERROR]', err);
         });
 
-        await page.setViewport({
-            width: Math.max(1, Number(maxWidth) || 300),
-            height: 800,
-            deviceScaleFactor: 2,
-        });
-
         const safeDirection = direction === 'ltr' ? 'ltr' : 'rtl';
-        const escapedWirisFlag = escapeHtmlForAttribute(useWiris ? '1' : '0');
+        const escapedWirisFlag = escapeHtmlForAttribute(effectiveUseWiris ? '1' : '0');
+        const tajawalFont = getFontDataUrl('Tajawal-Regular.ttf');
 
         const wrappedHtml = `<!doctype html>
 <html dir="${safeDirection}">
@@ -109,14 +280,7 @@ export const handler = async (event) => {
 <style>
 @font-face {
   font-family: 'Tajawal';
-  src: url('file:///var/task/fonts/Tajawal-Regular.ttf') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-}
-
-@font-face {
-  font-family: 'Noto Sans Arabic';
-  src: url('file:///var/task/fonts/NotoSansArabic-Regular.ttf') format('truetype');
+  src: url('${tajawalFont}') format('truetype');
   font-weight: normal;
   font-style: normal;
 }
@@ -133,7 +297,7 @@ body {
 
 #capture {
   direction: ${safeDirection};
-  unicode-bidi: embed;
+  unicode-bidi: isolate;
   display: inline-block;
   max-width: ${Number(maxWidth) || 300}px;
   padding: ${Number(padding) || 0}px;
@@ -145,9 +309,85 @@ body {
   word-break: break-word;
 }
 
-#capture,
-#capture * {
-  font-family: 'Tajawal', 'Noto Sans Arabic', sans-serif !important;
+#capture {
+  font-family: 'Noto Naskh Arabic', 'Noto Sans Arabic', 'Tajawal', sans-serif !important;
+}
+
+#capture p,
+#capture div,
+#capture li {
+  display: block;
+  margin: 0 0 0.6em;
+}
+
+#capture p:last-child,
+#capture div:last-child,
+#capture li:last-child {
+  margin-bottom: 0;
+}
+
+#capture .math-text-run {
+  display: inline;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+  line-height: 1.5;
+  font-family: 'Noto Naskh Arabic', 'Noto Sans Arabic', 'Tajawal', sans-serif !important;
+}
+
+#capture .math-multiline {
+  display: block;
+  max-width: 100%;
+}
+
+#capture .math-line {
+  display: block;
+}
+
+#capture .inline-math-rtl {
+  display: inline-flex;
+  direction: rtl;
+  unicode-bidi: isolate;
+  vertical-align: middle;
+}
+
+#capture .inline-math-rtl math {
+  display: inline-block;
+}
+
+#capture .rtl-inline-run {
+  display: inline;
+  direction: rtl;
+  unicode-bidi: isolate;
+}
+
+#capture math,
+#capture math * {
+  font-family: 'Noto Math', math, 'Cambria Math', 'STIX Two Math', serif !important;
+}
+
+#capture math[dir="rtl"] {
+  display: block;
+  max-width: 100%;
+  direction: rtl;
+  unicode-bidi: isolate;
+  white-space: normal;
+}
+
+#capture math[dir="rtl"] mi,
+#capture math[dir="rtl"] mtext,
+#capture math[dir="rtl"] ms {
+  font-family: 'Noto Naskh Arabic', 'Noto Sans Arabic', 'Tajawal', sans-serif !important;
+  font-size: 1.14em;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0;
+  direction: rtl;
+  unicode-bidi: plaintext;
+}
+
+#capture math[dir="rtl"] mtext {
+  white-space: normal;
 }
 
 #capture img {
@@ -159,8 +399,8 @@ body {
 
 <script>
 (function () {
-  window.__wirisDone = ${useWiris ? 'false' : 'true'};
-  window.__wirisEnabled = ${useWiris ? 'true' : 'false'};
+  window.__wirisDone = ${effectiveUseWiris ? 'false' : 'true'};
+  window.__wirisEnabled = ${effectiveUseWiris ? 'true' : 'false'};
 
   function markWirisDone() {
     window.__wirisDone = true;
@@ -235,11 +475,11 @@ body {
 </script>
 </head>
 <body data-use-wiris="${escapedWirisFlag}">
-  <div id="capture">${html}</div>
+  <div id="capture">${processedHtml}</div>
 </body>
 </html>`;
 
-        await page.setContent(wrappedHtml, { waitUntil: 'domcontentloaded' });
+        page = await setPageContentWithRetry(browser, page, wrappedHtml, { waitUntil: 'domcontentloaded' });
 
         await page.evaluate(async () => {
             if (document.fonts && document.fonts.ready) {
@@ -247,7 +487,7 @@ body {
             }
         });
 
-        if (useWiris) {
+        if (effectiveUseWiris) {
             await page.waitForFunction(() => window.__wirisDone === true, {
                 timeout: 15000,
             });
@@ -275,12 +515,6 @@ body {
             };
         });
 
-        await page.setViewport({
-            width: Math.max(1, final.width),
-            height: Math.max(1, final.height),
-            deviceScaleFactor: 2,
-        });
-
         await page.evaluate(() => {
             return new Promise((resolve) => {
                 requestAnimationFrame(() => {
@@ -297,6 +531,7 @@ body {
         const imageBuffer = await el.screenshot({
             type: 'png',
             omitBackground: true,
+            captureBeyondViewport: true,
         });
 
         await browser.close();
@@ -316,7 +551,7 @@ body {
                 width: final.width,
                 height: final.height,
                 size: imageBuffer.length,
-                useWiris,
+                useWiris: effectiveUseWiris,
             });
         }
 
@@ -336,7 +571,7 @@ body {
             width: final.width,
             height: final.height,
             size: imageBuffer.length,
-            useWiris,
+            useWiris: effectiveUseWiris,
         });
     } catch (error) {
         console.error('Lambda Error:', error);
