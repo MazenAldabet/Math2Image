@@ -172,6 +172,21 @@ function containsArabicMathContent(html) {
     const mathBlocks = html.match(/<math[\s\S]*?<\/math>/gi) || [];
     return mathBlocks.some((block) => /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(decodeNumericEntities(block)));
 }
+
+function stripRTLFromPTags(html) {
+  return html.replace(/<p\b([^>]*)>/gi, (match, attrs) => {
+    let newAttrs = attrs;
+
+    // remove dir="rtl"
+    newAttrs = newAttrs.replace(/\sdir\s*=\s*["']rtl["']/gi, '');
+
+    // remove direction: rtl from style
+    newAttrs = newAttrs.replace(/direction\s*:\s*rtl\s*;?/gi, '');
+
+    return `<p${newAttrs}>`;
+  });
+}
+
 export function preprocessHtmlForRender(html) {
     const withInlineRtlMath = wrapInlineRtlMath(html);
     const withAdjacentInlineOrderFixed = reorderAdjacentArabicAndInlineMath(withInlineRtlMath);
@@ -198,7 +213,7 @@ export function preprocessHtmlForRender(html) {
     // Wrap math blocks with <p> if not already wrapped
     const wrappedMath = withNormalizedMi.replace(
         /(<math[\s\S]*?<\/math>)/gi,
-        (mathBlock) => `<span>${mathBlock}</span>`
+        (mathBlock) => `<p style="display:inline-block">${mathBlock}</p>`
     );
 
     return wrappedMath;
@@ -226,9 +241,9 @@ export const handler = async (event) => {
         if (storage === 's3' && (!bucket || !key)) {
             return response(400, { error: 'bucket and key required for s3' });
         }
-
-        const processedHtml = preprocessHtmlForRender(html);
-        const effectiveUseWiris = useWiris && !containsArabicMathContent(html);
+        const strippedHtml = stripRTLFromPTags(html);
+        const processedHtml = preprocessHtmlForRender(strippedHtml);
+        const effectiveUseWiris = useWiris && !containsArabicMathContent(strippedHtml);
 
         const initialViewport = {
             width: Math.max(1, Number(maxWidth) || 300),
